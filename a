@@ -1,0 +1,2012 @@
+--[[
+    ╔═══════════════════════════════════════════════════════════════════════╗
+    ║  HOOK  ·  Roblox → webhook toolkit  ·  v1.0.0                          ║
+    ║  embeds · mentions · stats · PNG charts · live dashboards · watchers   ║
+    ╚═══════════════════════════════════════════════════════════════════════╝
+
+    local Hook = loadstring(game:HttpGet("https://your.host/Hook.lua"))()
+    Hook:SetUrl("https://discord.com/api/webhooks/ID/TOKEN")      -- set AFTER loading
+    Hook:Configure{ Username = "Pet Farm", Theme = "Mono", Color = "blurple" }
+    Hook:SetPing{ User = "123456789012345678" }                   -- who gets pinged by Ping=true
+
+    ── QUICK ────────────────────────────────────────────────────────────────
+    Hook:Send("hello")                                  Hook:Send("hi", {Ping = true})
+    Hook:Success("Hatched!", "Got a **Huge Cat**")      Hook:Error("Stuck", "No eggs left", {Ping = true})
+    Hook:Embed():Title("Hi"):Color("gold"):Field("Coins", "1.2M", true):Send()
+    Hook:Test()                                         -- sanity check
+
+    ── STATS (pet autofarm) ─────────────────────────────────────────────────
+    local stats = Hook:Stats{ Title = "Pet Farm", SampleEvery = 15 }
+    stats:Track("Coins", leaderstats.Coins, { Icon = "💰" })          -- Value object
+    stats:Track("Gems",  function() return getGems() end, { Icon = "💎" })
+    stats:Track("Eggs",  0)                                           -- manual: stats:Add("Eggs", 1)
+    stats:Milestone("Coins", 1e9)                                     -- ping every 1B
+    stats:Stall("Coins", 300, { Ping = true })                        -- alert if no change 5 min
+    stats:Persist("petfarm.json")                                     -- survive server hops
+    stats:Auto(600, { Chart = "Coins", ChartType = "area", ChartMode = "rate" })
+    stats:Live(60,  { Chart = { "Coins", "Gems" } })                  -- one message, edited forever
+    stats:Report{ Chart = { { Stats = {"Coins","Gems"}, Type = "line" } } }
+
+    ── CHARTS (pure-Lua PNG, monochrome, themeable) ─────────────────────────
+    types: line · area · spark · bar · hbar · pie · donut · gauge
+    local c = Hook:Chart("area", { Title = "Coins/hr", Data = {1,4,2,8}, Theme = "Amber" })
+    Hook:Send(c)   Hook:Chart("pie", { Items = { Cats = 40, Dogs = 25 } }):Send()
+    Hook:Chart("gauge", { Value = 76, Label = "BACKPACK" }) 
+    Themes: Mono · Light · Amber · Matrix · Ice · Rose · or { Background, Foreground, Accent, Grid, Fill }
+
+    ── WATCHERS ─────────────────────────────────────────────────────────────
+    Hook:WatchDisconnect()  Hook:WatchPlayers{ Only = {"ModName"}, Ping = true }
+    Hook:Heartbeat(900)     Hook:Every(60, fn)   Hook:Log("text")   Hook:Flush()
+]]
+
+local VERSION = "1.0.0"
+
+--══════════════════════════════════════════════════════════════════════════
+--  ENV / UTILS
+--══════════════════════════════════════════════════════════════════════════
+local floor, ceil, max, min, abs, sqrt = math.floor, math.ceil, math.max, math.min, math.abs, math.sqrt
+local fmt, char, byte, rep = string.format, string.char, string.byte, string.rep
+local concat, insert, remove, sort = table.concat, table.insert, table.remove, table.sort
+local unpack = table.unpack or unpack
+local clock, time = os.clock, os.time
+local typeof = typeof or type
+local band, bxor, rshift, lshift = bit32.band, bit32.bxor, bit32.rshift, bit32.lshift
+local PI = math.pi
+
+local function service(n)
+	local ok, s = pcall(function() return game:GetService(n) end)
+	return ok and s or nil
+end
+local HttpService = service("HttpService")
+local Players = service("Players")
+
+local function jenc(t) return HttpService:JSONEncode(t) end
+local function jdec(s)
+	local ok, r = pcall(function() return HttpService:JSONDecode(s) end)
+	return ok and r or nil
+end
+
+local function clamp(v, a, b) return v < a and a or (v > b and b or v) end
+local function iso(t) return os.date("!%Y-%m-%dT%H:%M:%SZ", t or time()) end
+local function dateStr(f, t)
+	local ok, s = pcall(os.date, f, floor(t))
+	return ok and s or tostring(t)
+end
+
+local function trunc(s, n)
+	s = tostring(s)
+	if utf8 and utf8.len then
+		local l = utf8.len(s)
+		if l then
+			if l <= n then return s end
+			local o = utf8.offset(s, n - 2)
+			return s:sub(1, (o or n) - 1) .. "..."
+		end
+	end
+	if #s <= n then return s end
+	return s:sub(1, n - 3) .. "..."
+end
+
+local function splitText(s, n)
+	local out = {}
+	while #s > n do
+		local p = s:sub(1, n):match(".*()\n")
+		local chunk, rest
+		if p and p > n * 0.4 then chunk, rest = s:sub(1, p - 1), s:sub(p + 1)
+		else chunk, rest = s:sub(1, n), s:sub(n + 1) end
+		out[#out + 1] = chunk
+		s = rest
+	end
+	out[#out + 1] = s
+	return out
+end
+
+--══════════════════════════════════════════════════════════════════════════
+--  FORMAT
+--══════════════════════════════════════════════════════════════════════════
+local Format = {}
+local SUF = { "K", "M", "B", "T", "Qa", "Qi", "Sx", "Sp", "Oc", "No", "Dc" }
+
+local function trim0(s)
+	if s:find(".", 1, true) then
+		s = (s:gsub("0+$", ""))
+		s = (s:gsub("%.$", ""))
+	end
+	return s
+end
+
+-- 1234567 -> "1.23M"
+function Format.Number(n, d, space)
+	n = tonumber(n) or 0
+	d = d or 2
+	if n ~= n then return "NaN" end
+	if n == math.huge then return "inf" elseif n == -math.huge then return "-inf" end
+	local a = abs(n)
+	if a < 1000 then
+		if n == floor(n) then return fmt("%d", n) end
+		return trim0(fmt("%." .. d .. "f", n))
+	end
+	local i = 0
+	while a >= 1000 and i < #SUF do a = a / 1000; i = i + 1 end
+	local s = fmt("%." .. d .. "f", a)
+	if tonumber(s) >= 1000 and i < #SUF then a = a / 1000; i = i + 1; s = fmt("%." .. d .. "f", a) end
+	return (n < 0 and "-" or "") .. trim0(s) .. (space and " " or "") .. SUF[i]
+end
+
+function Format.Commas(n)
+	local s = fmt("%.0f", abs(tonumber(n) or 0))
+	local k
+	repeat s, k = s:gsub("^(%d+)(%d%d%d)", "%1,%2") until k == 0
+	return ((tonumber(n) or 0) < 0 and "-" or "") .. s
+end
+
+-- 3661 -> "01:01:01"  |  short: "1h 1m"
+function Format.Duration(sec, short)
+	sec = floor(max(0, tonumber(sec) or 0))
+	local h, m, s = floor(sec / 3600), floor(sec % 3600 / 60), sec % 60
+	if short then
+		if h > 0 then return fmt("%dh %dm", h, m) end
+		if m > 0 then return fmt("%dm %ds", m, s) end
+		return s .. "s"
+	end
+	return fmt("%02d:%02d:%02d", h, m, s)
+end
+
+function Format.Percent(v, d) return fmt("%." .. (d or 1) .. "f%%", tonumber(v) or 0) end
+function Format.Bar(f, width, a, b)
+	width = width or 10
+	local n = floor(clamp(f or 0, 0, 1) * width + 0.5)
+	return rep(a or "▰", n) .. rep(b or "▱", width - n)
+end
+function Format.Trend(delta, f)
+	f = f or Format.Number
+	if delta == 0 or delta ~= delta then return "▬ no change" end
+	if delta > 0 then return "▲ +" .. f(delta) end
+	return "▼ -" .. f(-delta)
+end
+function Format.Code(s, lang) return "```" .. (lang or "") .. "\n" .. tostring(s) .. "\n```" end
+function Format.Link(text, url) return "[" .. text .. "](" .. url .. ")" end
+
+-- Format.Table({{"a","b"},{"c","d"}}, {"Col1","Col2"}) -> code block
+function Format.Table(rows, headers)
+	local all, widths = {}, {}
+	if headers then all[1] = headers end
+	for _, r in ipairs(rows) do all[#all + 1] = r end
+	for _, r in ipairs(all) do
+		for i, c in ipairs(r) do widths[i] = max(widths[i] or 0, #tostring(c)) end
+	end
+	local out = {}
+	for ri, r in ipairs(all) do
+		local cells = {}
+		for i = 1, #widths do
+			local c = tostring(r[i] or "")
+			cells[i] = c .. rep(" ", widths[i] - #c)
+		end
+		out[#out + 1] = concat(cells, "  ")
+		if headers and ri == 1 then
+			local ln = {}
+			for i = 1, #widths do ln[i] = rep("-", widths[i]) end
+			out[#out + 1] = concat(ln, "  ")
+		end
+	end
+	return Format.Code(concat(out, "\n"))
+end
+
+local num = Format.Number
+
+--══════════════════════════════════════════════════════════════════════════
+--  MENTIONS
+--══════════════════════════════════════════════════════════════════════════
+local Mention = {
+	User = function(id) return "<@" .. tostring(id) .. ">" end,
+	Role = function(id) return "<@&" .. tostring(id) .. ">" end,
+	Channel = function(id) return "<#" .. tostring(id) .. ">" end,
+	Everyone = "@everyone",
+	Here = "@here",
+	-- styles: t T d D f F R   (R = "2 minutes ago")
+	Time = function(ts, style) return "<t:" .. floor(ts or time()) .. ":" .. (style or "R") .. ">" end,
+}
+
+--══════════════════════════════════════════════════════════════════════════
+--  COLORS / THEMES
+--══════════════════════════════════════════════════════════════════════════
+local NAMED = {
+	red = 0xED4245, green = 0x57F287, blue = 0x3498DB, yellow = 0xFEE75C, orange = 0xE67E22,
+	purple = 0x9B59B6, pink = 0xEB459E, cyan = 0x1ABC9C, white = 0xFFFFFF, black = 0x000000,
+	gray = 0x95A5A6, grey = 0x95A5A6, gold = 0xF1C40F, blurple = 0x5865F2, dark = 0x2B2D31,
+	info = 0x5865F2, success = 0x57F287, warn = 0xFEE75C, error = 0xED4245,
+}
+
+-- Color3 | 0xRRGGBB | "#RRGGBB" | "#RGB" | "name" | {r,g,b}  ->  integer
+local function toColor(c, def)
+	local t = typeof(c)
+	if t == "Color3" then
+		return floor(c.R * 255 + 0.5) * 65536 + floor(c.G * 255 + 0.5) * 256 + floor(c.B * 255 + 0.5)
+	elseif t == "number" then
+		return floor(c)
+	elseif t == "string" then
+		local h = c:match("^#?(%x%x%x%x%x%x)$")
+		if h then return tonumber(h, 16) end
+		local s = c:match("^#(%x%x%x)$")
+		if s then return tonumber(s:gsub(".", "%0%0"), 16) end
+		return NAMED[c:lower()] or def
+	elseif t == "table" and c[1] then
+		return floor(c[1]) * 65536 + floor(c[2] or 0) * 256 + floor(c[3] or 0)
+	end
+	return def
+end
+local function rgb(i) return floor(i / 65536) % 256, floor(i / 256) % 256, i % 256 end
+
+local Themes = {
+	Mono   = { Background = 0x141414, Foreground = 0xB4B4B4, Accent = 0xFFFFFF },
+	Light  = { Background = 0xF2F2F2, Foreground = 0x4A4A4A, Accent = 0x000000 },
+	Amber  = { Background = 0x121212, Foreground = 0xB8892B, Accent = 0xFFD166 },
+	Matrix = { Background = 0x0B0F0B, Foreground = 0x2E9B4A, Accent = 0x9BFF9B },
+	Ice    = { Background = 0x0E1116, Foreground = 0x5B8DB8, Accent = 0xBFE3FF },
+	Rose   = { Background = 0x150F12, Foreground = 0xB05C7B, Accent = 0xFFB3CB },
+}
+
+local function themeTable(t)
+	if type(t) == "string" then return Themes[t] or Themes.Mono end
+	return type(t) == "table" and t or nil
+end
+local function resolveTheme(t, base)
+	local r = { Grid = 0.16, Fill = 0.3 }
+	for _, src in ipairs({ Themes.Mono, themeTable(base) or {}, themeTable(t) or {} }) do
+		for k, v in pairs(src) do r[k] = v end
+	end
+	r.Background = toColor(r.Background, 0x141414)
+	r.Foreground = toColor(r.Foreground, 0xB4B4B4)
+	r.Accent = toColor(r.Accent, 0xFFFFFF)
+	return r
+end
+
+--══════════════════════════════════════════════════════════════════════════
+--  5x7 BITMAP FONT  (ASCII 32..90 — lowercase is drawn uppercase)
+--══════════════════════════════════════════════════════════════════════════
+local FONT = [[
+00 00 00 00 00  00 00 5F 00 00  00 07 00 07 00  14 7F 14 7F 14  24 2A 7F 2A 12
+23 13 08 64 62  36 49 55 22 50  00 05 03 00 00  00 1C 22 41 00  00 41 22 1C 00
+14 08 3E 08 14  08 08 3E 08 08  00 50 30 00 00  08 08 08 08 08  00 60 60 00 00
+20 10 08 04 02  3E 51 49 45 3E  00 42 7F 40 00  42 61 51 49 46  21 41 45 4B 31
+18 14 12 7F 10  27 45 45 45 39  3C 4A 49 49 30  01 71 09 05 03  36 49 49 49 36
+06 49 49 29 1E  00 36 36 00 00  00 56 36 00 00  08 14 22 41 00  14 14 14 14 14
+00 41 22 14 08  02 01 51 09 06  32 49 79 41 3E  7E 11 11 11 7E  7F 49 49 49 36
+3E 41 41 41 22  7F 41 41 22 1C  7F 49 49 49 41  7F 09 09 09 01  3E 41 49 49 7A
+7F 08 08 08 7F  00 41 7F 41 00  20 40 41 3F 01  7F 08 14 22 41  7F 40 40 40 40
+7F 02 0C 02 7F  7F 04 08 10 7F  3E 41 41 41 3E  7F 09 09 09 06  3E 41 51 21 5E
+7F 09 19 29 46  46 49 49 49 31  01 01 7F 01 01  3F 40 40 40 3F  1F 20 40 20 1F
+3F 40 38 40 3F  63 14 08 14 63  07 08 70 08 07  61 51 49 45 43
+]]
+local GLYPH = {}
+do
+	local list = {}
+	for h in FONT:gmatch("%x%x") do list[#list + 1] = tonumber(h, 16) end
+	for i = 0, 58 do
+		local o = i * 5
+		GLYPH[char(32 + i)] = { list[o + 1], list[o + 2], list[o + 3], list[o + 4], list[o + 5] }
+	end
+	GLYPH["_"] = { 0x40, 0x40, 0x40, 0x40, 0x40 }
+end
+
+--══════════════════════════════════════════════════════════════════════════
+--  PNG ENCODER  (indexed colour, stored-deflate — no dependencies)
+--══════════════════════════════════════════════════════════════════════════
+local CRC
+local function crc32(s, c, yf)
+	if not CRC then
+		CRC = {}
+		for i = 0, 255 do
+			local v = i
+			for _ = 1, 8 do
+				if band(v, 1) == 1 then v = bxor(rshift(v, 1), 0xEDB88320) else v = rshift(v, 1) end
+			end
+			CRC[i] = v
+		end
+	end
+	c = c or 0xFFFFFFFF
+	local n, cn = #s, 0
+	for i = 1, n, 3000 do
+		local t = { byte(s, i, min(i + 2999, n)) }
+		for k = 1, #t do c = bxor(CRC[band(bxor(c, t[k]), 255)], rshift(c, 8)) end
+		cn = cn + 1
+		if yf and cn % 24 == 0 then task.wait() end
+	end
+	return c
+end
+
+local function adler32(s, yf)
+	local a, b, n, cn = 1, 0, #s, 0
+	for i = 1, n, 3800 do
+		local t = { byte(s, i, min(i + 3799, n)) }
+		for k = 1, #t do a = a + t[k]; b = b + a end
+		a, b = a % 65521, b % 65521
+		cn = cn + 1
+		if yf and cn % 24 == 0 then task.wait() end
+	end
+	return b * 65536 + a
+end
+
+local function be32(n) return char(floor(n / 16777216) % 256, floor(n / 65536) % 256, floor(n / 256) % 256, n % 256) end
+
+local function pngChunk(typ, data, yf)
+	local c = crc32(data, crc32(typ), yf)
+	return be32(#data) .. typ .. data .. be32(bxor(c, 0xFFFFFFFF))
+end
+
+local function zlibStore(raw, yf)
+	local out, n, pos = { "\120\1" }, #raw, 1
+	while pos <= n do
+		local len = min(65535, n - pos + 1)
+		local fin = (pos + len > n) and 1 or 0
+		out[#out + 1] = char(fin, len % 256, floor(len / 256), (65535 - len) % 256, floor((65535 - len) / 256))
+		out[#out + 1] = raw:sub(pos, pos + len - 1)
+		pos = pos + len
+	end
+	out[#out + 1] = be32(adler32(raw, yf))
+	return concat(out)
+end
+
+local function encodePNG(w, h, palette, raw, yf)
+	return "\137PNG\r\n\26\n"
+		.. pngChunk("IHDR", be32(w) .. be32(h) .. char(8, 3, 0, 0, 0), yf)
+		.. pngChunk("PLTE", palette, yf)
+		.. pngChunk("IDAT", zlibStore(raw, yf), yf)
+		.. pngChunk("IEND", "", yf)
+end
+
+--══════════════════════════════════════════════════════════════════════════
+--  CANVAS  (pixel = pal*128 + level ;  pal 0 = foreground ramp, 1 = accent ramp)
+--══════════════════════════════════════════════════════════════════════════
+local Canvas = {}
+Canvas.__index = Canvas
+
+local function newCanvas(w, h)
+	local buf = table.create and table.create(w * h, 0) or {}
+	if not table.create then for i = 1, w * h do buf[i] = 0 end end
+	return setmetatable({ w = w, h = h, buf = buf }, Canvas)
+end
+
+local function put(buf, i, pal, lv)
+	local e = buf[i]
+	if e >= 128 then
+		if pal == 1 then
+			if lv > e - 128 then buf[i] = 128 + lv end
+		elseif lv >= e - 128 then buf[i] = lv end
+	else
+		if pal == 0 then
+			if lv > e then buf[i] = lv end
+		elseif lv >= e then buf[i] = 128 + lv end
+	end
+end
+
+function Canvas:px(x, y, ink, pal)
+	if x < 0 or y < 0 or x >= self.w or y >= self.h then return end
+	local lv = floor(min(ink, 1) * 127 + 0.5)
+	if lv > 0 then put(self.buf, y * self.w + x + 1, pal or 0, lv) end
+end
+
+function Canvas:rect(x0, y0, x1, y1, ink, pal)
+	local lv = floor(min(ink, 1) * 127 + 0.5)
+	if lv <= 0 then return end
+	pal = pal or 0
+	x0, y0 = max(0, floor(x0)), max(0, floor(y0))
+	x1, y1 = min(self.w - 1, floor(x1)), min(self.h - 1, floor(y1))
+	local w, buf = self.w, self.buf
+	for y = y0, y1 do
+		local o = y * w + 1
+		for x = x0, x1 do put(buf, o + x, pal, lv) end
+	end
+end
+
+function Canvas:hline(x0, x1, y, ink, pal, dashed)
+	for x = floor(x0), floor(x1) do
+		if not dashed or x % 6 < 3 then self:px(x, y, ink, pal) end
+	end
+end
+function Canvas:vline(x, y0, y1, ink, pal, dashed)
+	for y = floor(y0), floor(y1) do
+		if not dashed or y % 6 < 3 then self:px(x, y, ink, pal) end
+	end
+end
+
+-- anti-aliased line, thickness in px (continuous coordinates)
+function Canvas:line(x0, y0, x1, y1, ink, pal, thick)
+	thick = thick or 1
+	local steep = abs(y1 - y0) > abs(x1 - x0)
+	if steep then x0, y0, x1, y1 = y0, x0, y1, x1 end
+	if x0 > x1 then x0, y0, x1, y1 = x1, y1, x0, y0 end
+	local dx = x1 - x0
+	local g = dx > 1e-9 and (y1 - y0) / dx or 0
+	local half = thick / 2
+	for x = floor(x0), floor(x1) do
+		local cx = clamp(x + 0.5, x0, x1)
+		local y = y0 + g * (cx - x0)
+		local top, bot = y - half, y + half
+		for j = floor(top), floor(bot) do
+			local cov = min(j + 1, bot) - max(j, top)
+			if cov > 0 then
+				if steep then self:px(j, x, cov * ink, pal) else self:px(x, j, cov * ink, pal) end
+			end
+		end
+	end
+end
+
+function Canvas:circle(cx, cy, r, ink, pal)
+	for y = floor(cy - r - 1), ceil(cy + r + 1) do
+		for x = floor(cx - r - 1), ceil(cx + r + 1) do
+			local dx, dy = x + 0.5 - cx, y + 0.5 - cy
+			local cov = clamp(r + 0.5 - sqrt(dx * dx + dy * dy), 0, 1)
+			if cov > 0 then self:px(x, y, cov * ink, pal) end
+		end
+	end
+end
+
+-- gradient area under a polyline (pts = screen coords sorted by x)
+function Canvas:area(pts, base, ink, pal)
+	local n = #pts
+	if n < 2 then return end
+	local seg = 1
+	for x = ceil(pts[1][1]), floor(pts[n][1]) do
+		local cx = max(x + 0.5, pts[1][1])
+		while seg < n - 1 and pts[seg + 1][1] < cx do seg = seg + 1 end
+		local a, b = pts[seg], pts[seg + 1]
+		local dx = b[1] - a[1]
+		local y = dx > 0 and (a[2] + (b[2] - a[2]) * clamp((cx - a[1]) / dx, 0, 1)) or b[2]
+		local r0 = floor(y)
+		local span = max(base - y, 1)
+		for r = r0, floor(base) - 1 do
+			local f = clamp((r + 0.5 - y) / span, 0, 1)
+			local cov = (r == r0) and (1 - (y - r0)) or 1
+			self:px(x, r, ink * (1 - f) * cov, pal)
+		end
+	end
+end
+
+function Canvas:text(str, x, y, s, ink, pal, align, bold)
+	str = tostring(str):upper()
+	s = s or 1
+	local w = #str * 6 * s - s
+	x, y = floor(x), floor(y)
+	if align == "center" then x = x - floor(w / 2) elseif align == "right" then x = x - w end
+	for pass = 0, bold and 1 or 0 do
+		for i = 1, #str do
+			local g = GLYPH[str:sub(i, i)] or GLYPH["?"]
+			local gx = x + pass + (i - 1) * 6 * s
+			for c = 1, 5 do
+				local bits = g[c]
+				if bits ~= 0 then
+					for r = 0, 6 do
+						if band(bits, lshift(1, r)) ~= 0 then
+							self:rect(gx + (c - 1) * s, y + r * s, gx + c * s - 1, y + (r + 1) * s - 1, ink, pal)
+						end
+					end
+				end
+			end
+		end
+	end
+	return w
+end
+
+function Canvas:png(T, yf)
+	local br, bg, bb = rgb(T.Background)
+	local fr, fg, fb = rgb(T.Foreground)
+	local ar, ag, ab = rgb(T.Accent)
+	local pal = {}
+	for i = 0, 127 do
+		local t = i / 127
+		pal[#pal + 1] = char(floor(br + (fr - br) * t + 0.5), floor(bg + (fg - bg) * t + 0.5), floor(bb + (fb - bb) * t + 0.5))
+	end
+	for i = 0, 127 do
+		local t = i / 127
+		pal[#pal + 1] = char(floor(br + (ar - br) * t + 0.5), floor(bg + (ag - bg) * t + 0.5), floor(bb + (ab - bb) * t + 0.5))
+	end
+	local w, h, buf, rows = self.w, self.h, self.buf, {}
+	for y = 0, h - 1 do
+		local o, parts = y * w, { "\0" }
+		for x = 1, w, 250 do parts[#parts + 1] = char(unpack(buf, o + x, o + min(x + 249, w))) end
+		rows[#rows + 1] = concat(parts)
+	end
+	return encodePNG(w, h, concat(pal), concat(rows), yf)
+end
+
+--══════════════════════════════════════════════════════════════════════════
+--  CHART PAINTERS
+--══════════════════════════════════════════════════════════════════════════
+local function niceTicks(lo, hi, n)
+	local range = hi - lo
+	if range <= 0 then range = max(abs(hi), 1) end
+	local rough = range / max(n, 1)
+	local mag = 10 ^ floor(math.log10(rough))
+	local r = rough / mag
+	local step = (r <= 1 and 1 or r <= 2 and 2 or r <= 5 and 5 or 10) * mag
+	local t0, t1 = floor(lo / step + 1e-9) * step, ceil(hi / step - 1e-9) * step
+	local ticks = {}
+	for i = 0, min(30, floor((t1 - t0) / step + 0.5)) do ticks[#ticks + 1] = t0 + i * step end
+	return ticks
+end
+
+local function normPoints(data)
+	local pts = {}
+	for i, v in ipairs(data) do
+		if type(v) == "number" then
+			pts[#pts + 1] = { i, v }
+		elseif type(v) == "table" then
+			local x, y = v.x or v.t or v[1], v.y or v.v or v[2]
+			if x and y then pts[#pts + 1] = { x, y } end
+		end
+	end
+	return pts
+end
+
+local function normItems(items)
+	local out = {}
+	if type(items) ~= "table" then return out end
+	if #items > 0 then
+		for _, v in ipairs(items) do
+			if type(v) == "table" then
+				local l = v.Label or v.Name or v.label or v.name or v[1]
+				local val = v.Value or v.value or v[2]
+				out[#out + 1] = { label = tostring(l), value = tonumber(val) or 0 }
+			end
+		end
+	else
+		for k, v in pairs(items) do out[#out + 1] = { label = tostring(k), value = tonumber(v) or 0 } end
+		sort(out, function(a, b) return a.value > b.value end)
+	end
+	return out
+end
+
+local SERIES = { { 1, 0 }, { 1, 1 }, { 0.6, 0 }, { 0.6, 1 }, { 0.35, 0 }, { 0.35, 1 } }
+local function seriesPaint(i, s)
+	local p = SERIES[((i - 1) % #SERIES) + 1]
+	return p[1], s.accent and 1 or p[2]
+end
+
+local function header(cv, o, ts)
+	if o.Title then cv:text(o.Title, 14, 12, ts, 1, 0, "left", true) end
+	if o.Subtitle then cv:text(o.Subtitle, cv.w - 14, 12 + 7 * ts - 7, 1, 0.55, 0, "right") end
+	return o.Title and (12 + 7 * ts + 16) or 14
+end
+
+local function noData(cv, o, T, ts)
+	header(cv, o, ts)
+	cv:text("NO DATA", cv.w / 2, cv.h / 2 - 3.5 * ts, ts, 0.5, 0, "center")
+end
+
+-- ── line / area / spark ────────────────────────────────────────────────
+local function paintLine(cv, o, T)
+	local w, h = cv.w, cv.h
+	local mini = o.Minimal
+	local ts = mini and 1 or (o.FontScale or (w >= 480 and 2 or 1))
+	local raw = o.Series or { { Name = o.Title, Data = o.Data or {} } }
+	local S, total = {}, 0
+	local xmin, xmax, ymin, ymax = math.huge, -math.huge, math.huge, -math.huge
+	for i, s in ipairs(raw) do
+		local pts = normPoints(s.Data or s)
+		sort(pts, function(a, b) return a[1] < b[1] end)
+		for _, p in ipairs(pts) do
+			if p[1] < xmin then xmin = p[1] end
+			if p[1] > xmax then xmax = p[1] end
+			if p[2] < ymin then ymin = p[2] end
+			if p[2] > ymax then ymax = p[2] end
+		end
+		total = total + #pts
+		local fill = o.Fill
+		if s.Fill ~= nil then fill = s.Fill end
+		S[#S + 1] = { name = s.Name or ("Series " .. i), pts = pts, accent = s.Accent, fill = fill }
+	end
+	if total == 0 then return noData(cv, o, T, ts) end
+
+	local hh = (not mini or o.Title) and header(cv, o, ts) or 6
+	if xmax == xmin then xmin, xmax = xmin - 1, xmax + 1 end
+	if o.YMin then ymin = o.YMin elseif o.ZeroBase ~= false and ymin > 0 then ymin = 0 end
+	if o.YMax then ymax = o.YMax end
+	if ymax <= ymin then ymax = ymin + 1 end
+	local ticks
+	if mini then
+		ticks = { ymin, ymax }
+	else
+		ticks = niceTicks(ymin, ymax, o.YTicks or (h >= 260 and 5 or 3))
+		if not o.YMin then ymin = ticks[1] end
+		if not o.YMax then ymax = ticks[#ticks] end
+	end
+	local yfmt = o.YFormat or num
+
+	local lw = 0
+	if not mini then for _, t in ipairs(ticks) do lw = max(lw, #yfmt(t) * 6 * ts) end end
+	local x0, x1 = mini and 6 or lw + 16, w - (mini and 6 or 16)
+	local y0, y1 = hh, h - (mini and 6 or (7 * ts + 14))
+	local dx = xmax - xmin
+	local function X(x) return x0 + (x - xmin) / dx * (x1 - x0) end
+	local function Y(y) return y1 - (y - ymin) / (ymax - ymin) * (y1 - y0) end
+
+	if not mini then
+		for _, t in ipairs(ticks) do
+			if t >= ymin and t <= ymax then
+				local yy = floor(Y(t))
+				cv:hline(x0, x1, yy, T.Grid, 0, true)
+				cv:text(yfmt(t), x0 - 8, yy - floor(3.5 * ts), ts, 0.8, 0, "right")
+			end
+		end
+		cv:hline(x0, x1, floor(y1), 0.5, 0)
+		local isTime
+		if o.XTime ~= nil then isTime = o.XTime else isTime = xmin > 1e9 end
+		local tf = o.TimeFormat or (dx > 129600 and "%d/%m %H:%M" or (dx < 600 and "%H:%M:%S" or "%H:%M"))
+		local xf = o.XFormat or (isTime and function(v) return dateStr(tf, v) end or num)
+		local nx = clamp(floor((x1 - x0) / (#xf(xmax) * 6 * ts + 36)), 2, 6)
+		for i = 0, nx do
+			local xv = xmin + dx * i / nx
+			local lab = xf(xv)
+			local px = X(xv)
+			local tw = #lab * 6 * ts
+			cv:vline(floor(px), y0, y1, T.Grid * 0.7, 0, true)
+			cv:text(lab, clamp(px, tw / 2 + 2, w - tw / 2 - 2), y1 + 8, ts, 0.8, 0, "center")
+		end
+		if #S > 1 then -- legend
+			local cur = w - 14
+			for i = #S, 1, -1 do
+				local nm = trunc(S[i].name, 14)
+				local tw = #nm * 6 - 1
+				local ink, pal = seriesPaint(i, S[i])
+				cv:text(nm, cur - tw, 12 + floor(7 * ts / 2) - 3, 1, 0.85, 0)
+				cv:line(cur - tw - 20, 12 + floor(7 * ts / 2), cur - tw - 6, 12 + floor(7 * ts / 2), ink, pal, 2)
+				cur = cur - tw - 34
+			end
+		end
+	end
+
+	for i, s in ipairs(S) do
+		local pts = s.pts
+		local step = max(1, floor(#pts / ((x1 - x0) * 2)))
+		local sp = {}
+		for k = 1, #pts, step do sp[#sp + 1] = { X(pts[k][1]), Y(pts[k][2]) } end
+		local lp = pts[#pts]
+		if #pts > 0 and (#sp == 0 or sp[#sp][1] < X(lp[1])) then sp[#sp + 1] = { X(lp[1]), Y(lp[2]) } end
+		local ink, pal = seriesPaint(i, s)
+		local th = mini and 1.6 or 2
+		if s.fill then cv:area(sp, y1, T.Fill * (i == 1 and 1 or 0.6), pal) end
+		for k = 1, #sp - 1 do
+			cv:line(sp[k][1], sp[k][2], sp[k + 1][1], sp[k + 1][2], ink, pal, th)
+			if #sp < 200 then cv:circle(sp[k + 1][1], sp[k + 1][2], th / 2, ink, pal) end
+		end
+		local last = sp[#sp]
+		if last then
+			cv:circle(last[1], last[2], mini and 2.5 or 3.5, 1, 1)
+			if #S == 1 and not mini and o.ShowLast ~= false then
+				local lab = yfmt(lp[2])
+				local tw = #lab * 6 * ts
+				local ly = last[2] - 7 * ts - 9
+				if ly < 2 then ly = last[2] + 9 end
+				cv:text(lab, clamp(last[1], tw / 2 + 2, w - tw / 2 - 2), ly, ts, 1, 1, "center", true)
+			end
+		end
+	end
+end
+
+-- ── bar (vertical) ─────────────────────────────────────────────────────
+local function paintBar(cv, o, T)
+	local w, h = cv.w, cv.h
+	local ts = o.FontScale or (w >= 480 and 2 or 1)
+	local items = normItems(o.Items or o.Data)
+	if o.Sort == "desc" then sort(items, function(a, b) return a.value > b.value end)
+	elseif o.Sort == "asc" then sort(items, function(a, b) return a.value < b.value end) end
+	if o.Limit and #items > o.Limit then for i = #items, o.Limit + 1, -1 do items[i] = nil end end
+	if #items == 0 then return noData(cv, o, T, ts) end
+	local hh = header(cv, o, ts)
+	local vmax, vmin = 0, 0
+	local hi = 1
+	for i, it in ipairs(items) do
+		if it.value > vmax then vmax = it.value; hi = i end
+		vmin = min(vmin, it.value)
+	end
+	if vmax <= 0 then vmax = 1 end
+	local ticks = niceTicks(vmin, vmax, o.YTicks or (h >= 260 and 5 or 3))
+	local ymin, ymax = ticks[1], ticks[#ticks]
+	local yfmt = o.YFormat or num
+	local lw = 0
+	for _, t in ipairs(ticks) do lw = max(lw, #yfmt(t) * 6 * ts) end
+	local x0, x1, y0, y1 = lw + 16, w - 16, hh + 8 * ts, h - (7 * ts + 16)
+	local function Y(v) return y1 - (v - ymin) / (ymax - ymin) * (y1 - y0) end
+	for _, t in ipairs(ticks) do
+		local yy = floor(Y(t))
+		cv:hline(x0, x1, yy, T.Grid, 0, true)
+		cv:text(yfmt(t), x0 - 8, yy - floor(3.5 * ts), ts, 0.8, 0, "right")
+	end
+	local zero = floor(Y(0))
+	cv:hline(x0, x1, zero, 0.5, 0)
+	local n = #items
+	local slot = (x1 - x0) / n
+	local bw = max(2, floor(slot * 0.68))
+	for i, it in ipairs(items) do
+		local bx = x0 + (i - 1) * slot + (slot - bw) / 2
+		local by = Y(it.value)
+		local hot = (o.Highlight ~= false and n > 1 and i == hi)
+		local top, bot = min(by, Y(0)), max(by, Y(0))
+		cv:rect(bx, top, bx + bw - 1, bot - 1, hot and 0.85 or 0.45, hot and 1 or 0)
+		cv:rect(bx, top, bx + bw - 1, top + 1, 1, hot and 1 or 0)
+		local lab = yfmt(it.value)
+		local s = (#lab * 6 * ts <= slot) and ts or ((#lab * 6 <= slot) and 1 or nil)
+		if s then cv:text(lab, bx + bw / 2, top - 7 * s - 4, s, 1, hot and 1 or 0, "center") end
+		if n <= 24 or i % ceil(n / 24) == 0 then
+			local cl = tostring(it.label)
+			local ls = (#cl * 6 * ts <= slot) and ts or 1
+			local mc = floor(slot / (6 * ls))
+			if #cl > mc then cl = mc >= 2 and (cl:sub(1, mc - 1) .. ".") or cl:sub(1, 1) end
+			cv:text(cl, bx + bw / 2, y1 + 8, ls, 0.8, 0, "center")
+		end
+	end
+end
+
+-- ── hbar (horizontal) ──────────────────────────────────────────────────
+local function paintHBar(cv, o, T)
+	local w, h = cv.w, cv.h
+	local ts = o.FontScale or (w >= 480 and 2 or 1)
+	local items = normItems(o.Items or o.Data)
+	if o.Sort ~= false then sort(items, function(a, b) return a.value > b.value end) end
+	if o.Limit and #items > o.Limit then for i = #items, o.Limit + 1, -1 do items[i] = nil end end
+	if #items == 0 then return noData(cv, o, T, ts) end
+	local hh = header(cv, o, ts)
+	local n = #items
+	local slot = (h - hh - 12) / n
+	if slot < 7 * ts + 6 then ts = 1 end
+	local vmax, lw, vw = 0, 0, 0
+	local vf = o.YFormat or num
+	for _, it in ipairs(items) do
+		vmax = max(vmax, it.value)
+		lw = max(lw, min(#it.label, 16))
+		vw = max(vw, #vf(it.value))
+	end
+	if vmax <= 0 then vmax = 1 end
+	local x0 = lw * 6 * ts + 24
+	local x1 = w - 18 - vw * 6 * ts
+	local bh = max(3, floor(slot * 0.6))
+	cv:vline(floor(x0), hh, h - 8, 0.5, 0)
+	for i, it in ipairs(items) do
+		local cy = hh + (i - 0.5) * slot
+		local len = max(1, it.value / vmax * (x1 - x0))
+		local hot = (o.Highlight ~= false and n > 1 and i == 1)
+		cv:rect(x0 + 1, cy - bh / 2, x0 + len, cy + bh / 2 - 1, hot and 0.85 or 0.45, hot and 1 or 0)
+		cv:rect(x0 + len - 1, cy - bh / 2, x0 + len, cy + bh / 2 - 1, 1, hot and 1 or 0)
+		cv:text(trunc(it.label, 16), x0 - 8, cy - 3.5 * ts, ts, 0.85, 0, "right")
+		cv:text(vf(it.value), x0 + len + 8, cy - 3.5 * ts, ts, 1, hot and 1 or 0, "left")
+	end
+end
+
+-- ── pie / donut ────────────────────────────────────────────────────────
+local PIE = { 1, 0.78, 0.6, 0.46, 0.35, 0.26, 0.19, 0.13 }
+local function paintPie(cv, o, T, kind)
+	local w, h = cv.w, cv.h
+	local ts = o.FontScale or (w >= 480 and 2 or 1)
+	local donut = kind == "donut"
+	local all = normItems(o.Items or o.Data)
+	local items = {}
+	for _, it in ipairs(all) do if it.value > 0 then items[#items + 1] = it end end
+	if o.Sort ~= false then sort(items, function(a, b) return a.value > b.value end) end
+	local maxn = min(o.Max or 7, 7)
+	if #items > maxn then
+		local rest = 0
+		for i = maxn, #items do rest = rest + items[i].value end
+		for i = #items, maxn, -1 do items[i] = nil end
+		items[maxn] = { label = "Other", value = rest }
+	end
+	local total = 0
+	for _, it in ipairs(items) do total = total + it.value end
+	if total <= 0 then return noData(cv, o, T, ts) end
+
+	local hh = header(cv, o, ts)
+	local legend = o.Legend ~= false
+	local availH = h - hh - 12
+	local r = min(availH / 2, legend and w * 0.34 or (w / 2 - 14))
+	local cx = legend and (18 + r) or w / 2
+	local cy = hh + availH / 2
+	local rin = donut and r * (o.Hole or 0.6) or 0
+
+	local cum, acc = {}, 0
+	for i, it in ipairs(items) do acc = acc + it.value / total * 2 * PI; cum[i] = acc end
+	local atan2 = math.atan2 or function(y, x) return math.atan(y, x) end
+	local multi = #items > 1
+	for y = floor(cy - r - 1), ceil(cy + r + 1) do
+		for x = floor(cx - r - 1), ceil(cx + r + 1) do
+			local dx, dy = x + 0.5 - cx, y + 0.5 - cy
+			local d = sqrt(dx * dx + dy * dy)
+			local cov = clamp(r + 0.5 - d, 0, 1)
+			if donut then cov = min(cov, clamp(d - rin + 0.5, 0, 1)) end
+			if cov > 0 then
+				local a = atan2(dx, -dy)
+				if a < 0 then a = a + 2 * PI end
+				local k = 1
+				while k < #items and a >= cum[k] do k = k + 1 end
+				local ink = PIE[k] * cov
+				if multi and d > 0 then
+					local best = 9
+					for b = 0, #items do
+						local ang = (b == 0) and 0 or cum[b]
+						local da = abs(a - ang)
+						if da > PI then da = 2 * PI - da end
+						best = min(best, da * d)
+					end
+					ink = ink * clamp(best / 1.4, 0, 1)
+				end
+				cv:px(x, y, ink, k == 1 and 1 or 0)
+			end
+		end
+	end
+	if donut then
+		local ct = o.CenterText or num(total)
+		cv:text(ct, cx, cy - 3.5 * (ts + 1) - (o.CenterLabel and 5 or 0), ts + 1, 1, 1, "center", true)
+		if o.CenterLabel then cv:text(o.CenterLabel, cx, cy + 7 * ts - 3, 1, 0.6, 0, "center") end
+	end
+	if legend then
+		local lx = cx + r + 28
+		local avail = w - 14 - lx
+		local s = ts
+		if avail < 18 * 6 * s then s = 1 end
+		local rowh = 7 * s + 9
+		local y = cy - (#items * rowh) / 2 + 2
+		local maxc = max(3, floor((avail - 7 * s - 8 - 5 * 6 * s) / (6 * s)))
+		for i, it in ipairs(items) do
+			cv:rect(lx, y, lx + 7 * s - 1, y + 7 * s - 1, PIE[i], i == 1 and 1 or 0)
+			cv:text(trunc(it.label, maxc), lx + 7 * s + 8, y, s, 0.9, 0)
+			cv:text(fmt("%d%%", floor(it.value / total * 100 + 0.5)), w - 14, y, s, 1, i == 1 and 1 or 0, "right")
+			y = y + rowh
+		end
+	end
+end
+
+-- ── gauge ──────────────────────────────────────────────────────────────
+local function paintGauge(cv, o, T)
+	local w, h = cv.w, cv.h
+	local ts = o.FontScale or (w >= 480 and 2 or 1)
+	local vmax = o.Max or 100
+	local v = tonumber(o.Value) or 0
+	local frac = clamp(v / (vmax > 0 and vmax or 1), 0, 1)
+	local hh = header(cv, o, ts)
+	local cx, cy = w / 2, h - 12 - 7 * ts - 10
+	local r = min((w - 28) / 2, cy - hh - 4)
+	local rin = r * 0.74
+	local atan2 = math.atan2 or function(y, x) return math.atan(y, x) end
+	for y = floor(cy - r - 1), ceil(cy) - 1 do
+		for x = floor(cx - r - 1), ceil(cx + r + 1) do
+			local dx, dy = x + 0.5 - cx, y + 0.5 - cy
+			local d = sqrt(dx * dx + dy * dy)
+			local cov = min(clamp(r + 0.5 - d, 0, 1), clamp(d - rin + 0.5, 0, 1))
+			if cov > 0 and dy < 0 then
+				local t = (atan2(dx, -dy) + PI / 2) / PI
+				if t <= frac then cv:px(x, y, cov, 1) else cv:px(x, y, cov * 0.16, 0) end
+			end
+		end
+	end
+	local txt = o.Text
+	if not txt then
+		if o.Max == nil or o.Max == 100 then txt = fmt("%d%%", floor(v + 0.5)) else txt = num(v) .. " / " .. num(vmax) end
+	end
+	cv:text(txt, cx, cy - 7 * (ts + 2) - 6, ts + 2, 1, 1, "center", true)
+	local ly = cy + 8
+	cv:text("0", cx - (r + rin) / 2, ly, ts, 0.6, 0, "center")
+	cv:text(num(vmax), cx + (r + rin) / 2, ly, ts, 0.6, 0, "center")
+	if o.Label then cv:text(o.Label, cx, ly, ts, 0.9, 0, "center") end
+end
+
+--══════════════════════════════════════════════════════════════════════════
+--  CHART OBJECT
+--══════════════════════════════════════════════════════════════════════════
+local Chart = {}
+Chart.__index = Chart
+local chartN = 0
+local PAINT = {
+	line = paintLine, area = paintLine, spark = paintLine,
+	bar = paintBar, hbar = paintHBar, pie = paintPie, donut = paintPie, gauge = paintGauge,
+}
+
+local function newChart(kind, o, baseTheme, client)
+	kind = tostring(kind or "line"):lower()
+	if not PAINT[kind] then error("Hook: unknown chart type '" .. kind .. "' (line, area, spark, bar, hbar, pie, donut, gauge)", 3) end
+	o = o or {}
+	chartN = chartN + 1
+	local self = setmetatable({ Kind = kind, Opts = o, _n = chartN, _c = client }, Chart)
+	self.Theme = resolveTheme(o.Theme, baseTheme)
+	self.Width = clamp(floor(o.Width or (kind == "spark" and 360 or 640)), 120, 1200)
+	self.Height = clamp(floor(o.Height or (kind == "spark" and 90 or (kind == "gauge" and 260 or 320))), 60, 800)
+	return self
+end
+
+function Chart:FileName() return "chart_" .. self._n .. ".png" end
+
+-- returns PNG bytes (cached). pass true to yield between heavy steps (the sender does)
+function Chart:Render(yielding)
+	if self._png then return self._png end
+	local o = {}
+	for k, v in pairs(self.Opts) do o[k] = v end
+	if self.Kind == "spark" then
+		o.Minimal = true
+		if o.Fill == nil then o.Fill = true end
+	elseif self.Kind == "area" and o.Fill == nil then
+		o.Fill = true
+	end
+	local cv = newCanvas(self.Width, self.Height)
+	PAINT[self.Kind](cv, o, self.Theme, self.Kind)
+	self._png = cv:png(self.Theme, yielding)
+	return self._png
+end
+Chart.Png = Chart.Render
+
+function Chart:Send(opts)
+	if not self._c then error("Hook: this chart has no client; create it with Hook:Chart(...)", 2) end
+	return self._c:Send(self, opts)
+end
+
+function Chart:Update(opts)
+	for k, v in pairs(opts or {}) do self.Opts[k] = v end
+	self._png = nil
+	return self
+end
+
+--══════════════════════════════════════════════════════════════════════════
+--  EMBED BUILDER
+--══════════════════════════════════════════════════════════════════════════
+local Embed = {}
+Embed.__index = Embed
+local ZWSP = "\226\128\139"
+
+local function newEmbed(client, init)
+	local e = setmetatable({ _d = {}, _fields = {}, _files = {}, _c = client }, Embed)
+	if client then
+		e._d.color = client.Color
+		if client.Timestamp ~= false then e._d.timestamp = iso() end
+		if client.Footer then e._d.footer = { text = client.Footer, icon_url = client.FooterIcon } end
+		if client.Identity ~= false then
+			local who = client:_who()
+			if who then e._d.author = { name = who.name, icon_url = who.icon } end
+		end
+	end
+	if type(init) == "table" then e:_init(init) end
+	return e
+end
+
+function Embed:_init(t)
+	if t.Title then self:Title(t.Title, t.Url) end
+	if t.Url then self:Url(t.Url) end
+	if t.Description or t.Text then self:Description(t.Description or t.Text) end
+	if t.Color then self:Color(t.Color) end
+	if t.Author then
+		if type(t.Author) == "table" then self:Author(t.Author[1] or t.Author.Name, t.Author[2] or t.Author.Icon, t.Author.Url)
+		else self:Author(t.Author, t.AuthorIcon) end
+	end
+	if t.Footer then
+		if type(t.Footer) == "table" then self:Footer(t.Footer[1] or t.Footer.Text, t.Footer[2] or t.Footer.Icon)
+		else self:Footer(t.Footer, t.FooterIcon) end
+	end
+	if t.Thumbnail then self:Thumbnail(t.Thumbnail) end
+	if t.Image then self:Image(t.Image) end
+	if t.Fields then self:Fields(t.Fields) end
+	if t.Chart then self:Chart(t.Chart) end
+	if t.Timestamp ~= nil then self:Timestamp(t.Timestamp) end
+end
+
+function Embed:Title(t, url) self._d.title = t ~= nil and tostring(t) or nil; if url then self._d.url = url end; return self end
+function Embed:Url(u) self._d.url = u; return self end
+function Embed:Description(t) self._d.description = t ~= nil and tostring(t) or nil; return self end
+function Embed:Line(t) self._d.description = (self._d.description and (self._d.description .. "\n") or "") .. tostring(t); return self end
+Embed.Add = Embed.Line
+function Embed:Code(text, lang) return self:Line(Format.Code(text, lang)) end
+function Embed:Color(c) self._d.color = toColor(c, self._d.color); return self end
+function Embed:Timestamp(v)
+	if v == false then self._d.timestamp = nil else self._d.timestamp = iso(type(v) == "number" and v or time()) end
+	return self
+end
+function Embed:Author(name, icon, url)
+	self._d.author = name and { name = tostring(name), icon_url = icon, url = url } or nil
+	return self
+end
+function Embed:Footer(text, icon)
+	self._d.footer = text and { text = tostring(text), icon_url = icon } or nil
+	return self
+end
+function Embed:Thumbnail(x)
+	if type(x) == "table" then return self:Chart(x, true) end
+	self._d.thumbnail = x and { url = x } or nil
+	return self
+end
+function Embed:Image(x)
+	if type(x) == "table" then return self:Chart(x) end
+	self._d.image = x and { url = x } or nil
+	return self
+end
+function Embed:Field(name, value, inline)
+	self._fields[#self._fields + 1] = { name = tostring(name), value = tostring(value), inline = inline and true or false }
+	return self
+end
+function Embed:Fields(list)
+	for _, f in ipairs(list) do
+		local inl = f.Inline
+		if inl == nil then inl = f.inline end
+		if inl == nil then inl = f[3] end
+		self:Field(f.Name or f.name or f[1] or ZWSP, f.Value or f.value or f[2] or ZWSP, inl)
+	end
+	return self
+end
+function Embed:Blank(inline) return self:Field(ZWSP, ZWSP, inline) end
+
+-- attach a Chart object as the embed image (or thumbnail)
+function Embed:Chart(chart, thumb)
+	local url = "attachment://" .. chart:FileName()
+	if thumb then self._d.thumbnail = { url = url } else self._d.image = { url = url } end
+	self._files[#self._files + 1] = { name = chart:FileName(), chart = chart, mime = "image/png" }
+	return self
+end
+-- attach an arbitrary file (png/jpg can then be referenced as attachment://name)
+function Embed:File(name, data, mime)
+	self._files[#self._files + 1] = { name = name, data = data, mime = mime or "application/octet-stream" }
+	return self
+end
+
+function Embed:Build()
+	local d = {}
+	for k, v in pairs(self._d) do d[k] = v end
+	if d.title then d.title = trunc(d.title, 256) end
+	if d.description then d.description = trunc(d.description, 4096) end
+	if d.footer then d.footer = { text = trunc(d.footer.text, 2048), icon_url = d.footer.icon_url } end
+	if d.author then d.author = { name = trunc(d.author.name, 256), icon_url = d.author.icon_url, url = d.author.url } end
+	if #self._fields > 0 then
+		local f = {}
+		for i = 1, min(25, #self._fields) do
+			local x = self._fields[i]
+			local n, v = trunc(x.name, 256), trunc(x.value, 1024)
+			f[i] = { name = n == "" and ZWSP or n, value = v == "" and ZWSP or v, inline = x.inline }
+		end
+		d.fields = f
+	end
+	return d
+end
+
+function Embed:Send(opts)
+	if not self._c then error("Hook: this embed has no client; use Hook:Embed()", 2) end
+	return self._c:Send(self, opts)
+end
+
+--══════════════════════════════════════════════════════════════════════════
+--  TRANSPORT
+--══════════════════════════════════════════════════════════════════════════
+local function findRequester()
+	local env = (getgenv and getgenv()) or _G
+	local c = {
+		env.request, env.http_request,
+		env.syn and env.syn.request,
+		env.http and env.http.request,
+		env.fluxus and env.fluxus.request,
+	}
+	for i = 1, 5 do if type(c[i]) == "function" then return c[i] end end
+end
+
+local function lowerKeys(t)
+	local o = {}
+	for k, v in pairs(t or {}) do o[tostring(k):lower()] = v end
+	return o
+end
+
+local function transport(req)
+	local r = findRequester()
+	if r then
+		local res = r({ Url = req.Url, Method = req.Method, Headers = req.Headers, Body = req.Body })
+		return tonumber(res.StatusCode or res.Status) or 0, lowerKeys(res.Headers), res.Body or ""
+	end
+	if HttpService and HttpService.RequestAsync then
+		local res = HttpService:RequestAsync({ Url = req.Url, Method = req.Method, Headers = req.Headers, Body = req.Body })
+		return tonumber(res.StatusCode) or 0, lowerKeys(res.Headers), res.Body or ""
+	end
+	error("no HTTP function available (executor `request` / HttpService)")
+end
+
+local function multipart(json, files)
+	local b = "----HookBoundary" .. math.random(100000, 999999) .. math.random(100000, 999999)
+	local p = { "--" .. b .. '\r\nContent-Disposition: form-data; name="payload_json"\r\nContent-Type: application/json\r\n\r\n' .. json .. "\r\n" }
+	for i, f in ipairs(files) do
+		p[#p + 1] = "--" .. b .. '\r\nContent-Disposition: form-data; name="files[' .. (i - 1) .. ']"; filename="' .. f.name .. '"\r\nContent-Type: ' .. (f.mime or "application/octet-stream") .. "\r\n\r\n"
+		p[#p + 1] = f.data
+		p[#p + 1] = "\r\n"
+	end
+	p[#p + 1] = "--" .. b .. "--\r\n"
+	return concat(p), "multipart/form-data; boundary=" .. b
+end
+
+local MIME = { png = "image/png", jpg = "image/jpeg", jpeg = "image/jpeg", gif = "image/gif", txt = "text/plain", log = "text/plain", json = "application/json", csv = "text/csv" }
+
+--══════════════════════════════════════════════════════════════════════════
+--  CLIENT
+--══════════════════════════════════════════════════════════════════════════
+local Client = {}
+Client.__index = Client
+Client.Format, Client.Mention, Client.Themes, Client.ToColor, Client.Version = Format, Mention, Themes, toColor, VERSION
+
+local Handle = {}
+Handle.__index = Handle
+function Handle:Wait(timeout)
+	local t0 = clock()
+	while not self.Done do
+		task.wait(0.05)
+		if timeout and clock() - t0 > timeout then break end
+	end
+	return self.Ok, self.Id, self.Error
+end
+function Handle:Edit(a, o) return self._c:Edit(self, a, o) end
+function Handle:Delete() return self._c:Delete(self) end
+
+local HEADSHOT = "https://www.roblox.com/headshot-thumbnail/image?userId=%d&width=150&height=150&format=png"
+local _gname
+local function gameName()
+	if _gname then return _gname end
+	local ok, info = pcall(function() return service("MarketplaceService"):GetProductInfo(game.PlaceId) end)
+	_gname = (ok and info and info.Name) or ("Place " .. tostring(game.PlaceId))
+	return _gname
+end
+
+local fpsAvg
+local function startFps()
+	if fpsAvg then return end
+	fpsAvg = 60
+	pcall(function()
+		service("RunService").Heartbeat:Connect(function(dt) if dt > 0 then fpsAvg = fpsAvg * 0.92 + (1 / dt) * 0.08 end end)
+	end)
+end
+
+function Client:Configure(cfg)
+	for k, v in pairs(cfg or {}) do
+		if k == "Webhook" or k == "Url" then self:SetUrl(v)
+		elseif k == "Color" then self.Color = toColor(v, self.Color)
+		elseif k == "Ping" then self:SetPing(v)
+		else self[k] = v end
+	end
+	return self
+end
+
+function Client:SetUrl(url)
+	url = tostring(url or ""):match("^%s*(.-)%s*$")
+	url = url:gsub("discordapp%.com", "discord.com")
+	self.Url = url
+	return self
+end
+
+-- SetPing{ User = "id"|{ids}, Role = "id"|{ids}, Everyone = bool, Here = bool }  — used by Ping = true
+function Client:SetPing(t)
+	if type(t) == "string" or type(t) == "number" then t = { User = tostring(t) } end
+	self.PingTargets = t or {}
+	return self
+end
+
+local function newClient(url, cfg)
+	local self = setmetatable({
+		Color = 0x5865F2, Theme = "Mono", Timestamp = true, Identity = true,
+		Retries = 3, Interval = 0.35, MaxQueue = 200, LogInterval = 8, Debug = false,
+		PingTargets = {}, PingOn = { error = true },
+		_q = {}, _cool = {}, _logs = {}, _t0 = time(),
+	}, Client)
+	if type(url) == "table" then cfg, url = url, nil end
+	if url then self:SetUrl(url) end
+	if cfg then self:Configure(cfg) end
+	return self
+end
+
+function Client:_who()
+	if self._whoc then return self._whoc end
+	local ok, lp = pcall(function() return Players.LocalPlayer end)
+	if not ok or not lp then return nil end
+	self._whoc = { name = lp.DisplayName .. " (@" .. lp.Name .. ")", icon = fmt(HEADSHOT, lp.UserId) }
+	return self._whoc
+end
+
+function Client:Embed(init) return newEmbed(self, init) end
+function Client:Chart(kind, opts) return newChart(kind, opts, self.Theme, self) end
+
+-- ── message composition ────────────────────────────────────────────────
+local function pingText(self, ping)
+	if ping == true then ping = self.PingTargets end
+	if not ping then return "" end
+	if type(ping) == "string" or type(ping) == "number" then
+		ping = tostring(ping)
+		return ping:match("^%d+$") and Mention.User(ping) or ping
+	end
+	local out = {}
+	local function add(v, f)
+		if v == nil then return end
+		if type(v) == "table" then for _, x in ipairs(v) do out[#out + 1] = f(x) end else out[#out + 1] = f(v) end
+	end
+	add(ping.User or ping.Users, Mention.User)
+	add(ping.Role or ping.Roles, Mention.Role)
+	if ping.Everyone then out[#out + 1] = "@everyone" end
+	if ping.Here then out[#out + 1] = "@here" end
+	return concat(out, " ")
+end
+
+local function allowedMentions(content)
+	local am = { parse = {} }
+	if content then
+		local users, roles = {}, {}
+		for id in content:gmatch("<@!?(%d+)>") do users[#users + 1] = id end
+		for id in content:gmatch("<@&(%d+)>") do roles[#roles + 1] = id end
+		if #users > 0 then am.users = users end
+		if #roles > 0 then am.roles = roles end
+		if content:find("@everyone", 1, true) or content:find("@here", 1, true) then am.parse = { "everyone" } end
+	end
+	return am
+end
+
+local MSG_KEYS = { "Content", "Embed", "Embeds", "Files", "Chart", "Charts", "Username", "Avatar", "Ping", "Silent", "Tts", "ThreadName" }
+local EMBED_KEYS = { "Title", "Description", "Fields", "Image", "Thumbnail", "Footer", "Author", "Text" }
+local function hasAny(t, keys) for _, k in ipairs(keys) do if t[k] ~= nil then return true end end return false end
+
+function Client:_compose(a, o)
+	local embeds, content, opt = {}, nil, o or {}
+	local function addEmbed(e)
+		local mt = getmetatable(e)
+		if mt == Embed then embeds[#embeds + 1] = e
+		elseif mt == Chart then embeds[#embeds + 1] = self:Embed():Chart(e)
+		elseif type(e) == "table" then embeds[#embeds + 1] = self:Embed(e) end
+	end
+	local ta = type(a)
+	if ta == "string" or ta == "number" then
+		content = tostring(a)
+	elseif ta == "table" then
+		local mt = getmetatable(a)
+		if mt == Embed or mt == Chart then
+			addEmbed(a)
+		elseif hasAny(a, MSG_KEYS) then
+			opt = a
+			content = a.Content and tostring(a.Content) or nil
+			if a.Embed then addEmbed(a.Embed) end
+			for _, e in ipairs(a.Embeds or {}) do addEmbed(e) end
+			if a.Chart then addEmbed(a.Chart) end
+			for _, c in ipairs(a.Charts or {}) do addEmbed(c) end
+		elseif hasAny(a, EMBED_KEYS) then
+			addEmbed(a)
+		else
+			for _, e in ipairs(a) do addEmbed(e) end
+		end
+	end
+
+	local ping = pingText(self, opt.Ping)
+	if ping ~= "" then content = ping .. (content and (" " .. content) or "") end
+
+	local function build(text, group, files)
+		local p = {
+			content = text,
+			username = opt.Username or self.Username,
+			avatar_url = opt.Avatar or self.Avatar,
+			tts = opt.Tts,
+			thread_name = opt.ThreadName,
+			flags = opt.Silent and 4096 or nil,
+			allowed_mentions = (self.SafeMentions ~= false) and allowedMentions(text) or nil,
+		}
+		if group then
+			p.embeds = {}
+			for i, e in ipairs(group) do
+				p.embeds[i] = e:Build()
+				for _, f in ipairs(e._files) do files[#files + 1] = f end
+			end
+		end
+		return { payload = p, files = files }
+	end
+
+	local msgs = {}
+	local chunks = content and splitText(content, 2000) or {}
+	local groups = {}
+	for i = 1, #embeds, 10 do groups[#groups + 1] = { unpack(embeds, i, min(i + 9, #embeds)) } end
+	for i = 1, #chunks - 1 do msgs[#msgs + 1] = build(chunks[i]) end
+	if #chunks >= 1 or #groups >= 1 then
+		msgs[#msgs + 1] = build(chunks[#chunks], groups[1], {})
+	end
+	for i = 2, #groups do msgs[#msgs + 1] = build(nil, groups[i], {}) end
+
+	if opt.Files and #opt.Files > 0 then
+		if #msgs == 0 then msgs[1] = build(nil, nil, {}) end
+		local target = msgs[#msgs]
+		for _, f in ipairs(opt.Files) do
+			local name = f.Name or f.name or "file.txt"
+			local ext = name:match("%.(%w+)$")
+			target.files[#target.files + 1] = {
+				name = name, data = f.Data or f.data or "",
+				mime = f.Mime or f.mime or MIME[(ext or ""):lower()] or "application/octet-stream",
+			}
+		end
+	end
+	if #msgs == 0 then error("Hook: nothing to send (empty message)", 3) end
+	return msgs
+end
+
+-- ── queue / sender ─────────────────────────────────────────────────────
+function Client:_enqueue(job)
+	if type(self.Url) ~= "string" or self.Url == "" then
+		error("Hook: webhook URL not set — call Hook:SetUrl(\"https://discord.com/api/webhooks/...\")", 3)
+	end
+	if #self._q >= self.MaxQueue then
+		warn("[Hook] queue full, dropping message")
+		return setmetatable({ Done = true, Ok = false, Error = "queue full", _c = self }, Handle)
+	end
+	job.handle = setmetatable({ Done = false, Ok = false, _c = self }, Handle)
+	self._q[#self._q + 1] = job
+	if not self._running then
+		self._running = true
+		task.spawn(function()
+			while #self._q > 0 do
+				local j = remove(self._q, 1)
+				local ok, err = pcall(self._exec, self, j)
+				if not ok then
+					j.handle.Done, j.handle.Ok, j.handle.Error = true, false, tostring(err)
+					warn("[Hook] " .. tostring(err))
+				end
+			end
+			self._running = false
+		end)
+	end
+	return job.handle
+end
+
+function Client:_target(job)
+	local base = self.Url
+	local path, query = base:match("^([^?]*)%??(.*)$")
+	path = path:gsub("/+$", "")
+	local q = {}
+	if query ~= "" then q[#q + 1] = query end
+	if self.Thread then q[#q + 1] = "thread_id=" .. tostring(self.Thread) end
+	if job.method == "POST" and not job.plain then q[#q + 1] = "wait=true" end
+	if job.method ~= "POST" then
+		local t = job.target
+		local id = type(t) == "table" and t.Id or t
+		if not id then error("message id unknown (original send failed or still pending)") end
+		path = path .. "/messages/" .. tostring(id)
+	end
+	return path .. (#q > 0 and ("?" .. concat(q, "&")) or "")
+end
+
+function Client:_exec(job)
+	local h = job.handle
+	local function fail(err)
+		h.Done, h.Ok, h.Error = true, false, tostring(err)
+		warn("[Hook] send failed: " .. tostring(err))
+		if self.OnError then pcall(self.OnError, tostring(err)) end
+	end
+
+	-- build the request once (charts render here, yielding between heavy steps)
+	local built, url, headers, data = pcall(function()
+		local u = self:_target(job)
+		local hd, body = { ["Content-Type"] = "application/json" }, nil
+		if job.method ~= "DELETE" then
+			local files = job.files
+			if files and #files > 0 then
+				for _, f in ipairs(files) do
+					if not f.data and f.chart then f.data = f.chart:Render(true) end
+				end
+				body, hd["Content-Type"] = multipart(jenc(job.payload), files)
+			else
+				body = jenc(job.payload)
+			end
+		end
+		return u, hd, body
+	end)
+	if not built then return fail(url) end
+
+	local tries, rl, lastErr = 0, 0, nil
+	while true do
+		local gap = self._gate and (self._gate - clock()) or 0
+		if gap > 0 then task.wait(gap) end
+		tries = tries + 1
+		local ok, status, hdr, body = pcall(transport, { Url = url, Method = job.method, Headers = headers, Body = data })
+		if not ok then
+			lastErr = tostring(status)
+			if tries > self.Retries then break end
+			task.wait(0.5 * 2 ^ tries)
+		else
+			self._gate = clock() + self.Interval
+			if hdr["x-ratelimit-remaining"] == "0" and tonumber(hdr["x-ratelimit-reset-after"]) then
+				self._gate = max(self._gate, clock() + tonumber(hdr["x-ratelimit-reset-after"]) + 0.05)
+			end
+			if status >= 200 and status < 300 then
+				local d = body ~= "" and jdec(body) or nil
+				if type(d) == "table" and d.id then h.Id, h.Data = d.id, d end
+				if not h.Id and job.target then h.Id = type(job.target) == "table" and job.target.Id or job.target end
+				h.Ok, h.Done = true, true
+				if self.Debug then print("[Hook] sent (" .. status .. ")") end
+				return
+			elseif status == 429 then
+				local d = jdec(body)
+				local ra = (type(d) == "table" and tonumber(d.retry_after)) or tonumber(hdr["retry-after"]) or 2
+				self._gate = clock() + ra + 0.1
+				tries = tries - 1
+				rl = rl + 1
+				lastErr = "rate limited"
+				if rl > 8 then break end
+			elseif status >= 500 or status == 0 then
+				lastErr = "HTTP " .. status
+				if tries > self.Retries then break end
+				task.wait(0.5 * 2 ^ tries)
+			else
+				lastErr = "HTTP " .. status .. ": " .. trunc(body, 300)
+				break
+			end
+		end
+	end
+	fail(lastErr)
+end
+
+-- ── public sending API ─────────────────────────────────────────────────
+-- Send("text" | Embed | Chart | {embeds} | {Content=,Embeds=,Files=,Ping=,Silent=,...}, opts?)
+function Client:Send(a, o)
+	local msgs = self:_compose(a, o)
+	local h
+	for _, m in ipairs(msgs) do h = self:_enqueue({ method = "POST", payload = m.payload, files = m.files }) end
+	return h
+end
+
+function Client:Edit(target, a, o)
+	local msgs = self:_compose(a, o)
+	local m = msgs[#msgs]
+	local p = m.payload
+	p.username, p.avatar_url, p.thread_name, p.flags = nil, nil, nil, nil
+	p.content = p.content or ""
+	p.attachments = {}
+	return self:_enqueue({ method = "PATCH", payload = p, files = m.files, target = target })
+end
+
+function Client:Delete(target) return self:_enqueue({ method = "DELETE", target = target }) end
+
+-- post arbitrary JSON (Slack / Guilded / custom webhooks) — no Discord-specific query params
+function Client:Raw(tbl) return self:_enqueue({ method = "POST", payload = tbl, plain = true }) end
+
+function Client:SendFile(name, data, content, opts)
+	opts = opts or {}
+	return self:Send({ Content = content, Files = { { Name = name, Data = data } }, Ping = opts.Ping, Silent = opts.Silent })
+end
+
+-- block until everything queued has been sent (use before teleporting / leaving)
+function Client:Flush(timeout)
+	local t0 = clock()
+	while (#self._q > 0 or self._running) and (not timeout or clock() - t0 < timeout) do task.wait(0.05) end
+end
+
+-- ── notifications ──────────────────────────────────────────────────────
+local LEVELS = {
+	info = { 0x5865F2, "ℹ️" }, success = { 0x57F287, "✅" }, warn = { 0xFEE75C, "⚠️" },
+	error = { 0xED4245, "🚨" }, debug = { 0x95A5A6, "🐞" },
+}
+
+function Client:Context()
+	local c = {}
+	pcall(function()
+		local lp = Players.LocalPlayer
+		c.Player, c.DisplayName, c.UserId, c.AccountAge = lp.Name, lp.DisplayName, lp.UserId, lp.AccountAge
+		c.Avatar = fmt(HEADSHOT, lp.UserId)
+	end)
+	pcall(function()
+		c.PlaceId, c.JobId = game.PlaceId, game.JobId
+		c.Players, c.MaxPlayers = #Players:GetPlayers(), Players.MaxPlayers
+		c.Join = fmt("https://www.roblox.com/games/start?placeId=%d&gameInstanceId=%s", game.PlaceId, game.JobId)
+	end)
+	pcall(function() c.Ping = floor(service("Stats").Network.ServerStatsItem["Data Ping"]:GetValue()) end)
+	pcall(function() c.Memory = floor(service("Stats"):GetTotalMemoryUsageMb()) end)
+	startFps()
+	c.FPS = floor(fpsAvg or 0)
+	c.GameName = gameName()
+	c.Uptime = time() - self._t0
+	return c
+end
+
+local function contextFields(c)
+	return {
+		{ "Player", fmt("%s\n`@%s`", c.DisplayName or "?", c.Player or "?"), true },
+		{ "Game", trunc(c.GameName or "?", 60), true },
+		{ "Server", fmt("%s/%s players\n`%s`", c.Players or "?", c.MaxPlayers or "?", (c.JobId or ""):sub(1, 8)), true },
+		{ "Performance", fmt("%s FPS · %s ms\n%s MB", c.FPS or "?", c.Ping or "?", c.Memory or "?"), true },
+		{ "Uptime", Format.Duration(c.Uptime or 0, true), true },
+		{ "Join", c.Join and Format.Link("Join server", c.Join) or "?", true },
+	}
+end
+
+-- Notify(level, title, description?, { Fields, Chart, Ping, Silent, Color, Icon, Thumbnail, Context, Cooldown, Key })
+function Client:Notify(level, title, desc, o)
+	o = o or {}
+	local L = LEVELS[level] or LEVELS.info
+	if o.Cooldown then
+		local key, t = o.Key or (level .. ":" .. tostring(title)), clock()
+		if self._cool[key] and t - self._cool[key] < o.Cooldown then return nil end
+		self._cool[key] = t
+	end
+	local e = self:Embed():Color(o.Color or L[1]):Title((o.Icon or L[2]) .. " " .. tostring(title))
+	if desc then e:Description(desc) end
+	if o.Fields then e:Fields(o.Fields) end
+	if o.Context then
+		local c = self:Context()
+		e:Fields(contextFields(c))
+		if c.Avatar and not o.Thumbnail then e:Thumbnail(c.Avatar) end
+	end
+	if o.Thumbnail then e:Thumbnail(o.Thumbnail) end
+	if o.Chart then e:Chart(o.Chart) end
+	local ping = o.Ping
+	if ping == nil and self.PingOn[level] then ping = true end
+	return self:Send(e, { Ping = ping, Silent = o.Silent, Username = o.Username })
+end
+for lvl in pairs(LEVELS) do
+	Client[lvl:sub(1, 1):upper() .. lvl:sub(2)] = function(self, title, desc, o) return self:Notify(lvl, title, desc, o) end
+end
+
+function Client:Status(o)
+	o = o or {}
+	local c = self:Context()
+	local e = self:Embed():Title(o.Title or "📡 Status"):Color(o.Color or 0x57F287):Fields(contextFields(c))
+	if c.Avatar then e:Thumbnail(c.Avatar) end
+	if o.Chart then e:Chart(o.Chart) end
+	return self:Send(e, o)
+end
+
+function Client:Test()
+	return self:Success("Hook connected", "Webhook is working.\nHook `v" .. VERSION .. "` · " .. Mention.Time(time(), "T"), { Context = true })
+end
+
+-- ── scheduling ─────────────────────────────────────────────────────────
+function Client:Every(seconds, fn)
+	local alive = true
+	task.spawn(function()
+		while alive do
+			task.wait(seconds)
+			if not alive then break end
+			local ok, err = pcall(fn)
+			if not ok then warn("[Hook] Every(): " .. tostring(err)) end
+		end
+	end)
+	return { Stop = function() alive = false end }
+end
+
+function Client:Heartbeat(seconds, o) return self:Every(seconds, function() self:Status(o) end) end
+
+-- one message that is created once, then edited every `seconds`. builder() -> (message, opts)
+function Client:Live(seconds, builder)
+	local handle
+	local alive = true
+	local function tick()
+		local ok, msg, o = pcall(builder)
+		if not ok then warn("[Hook] Live(): " .. tostring(msg)); return end
+		if not msg then return end
+		if handle and (not handle.Done or handle.Id) then self:Edit(handle, msg, o) else handle = self:Send(msg, o) end
+	end
+	task.spawn(function()
+		tick()
+		while alive do
+			task.wait(seconds)
+			if alive then tick() end
+		end
+	end)
+	return { Stop = function() alive = false end, Update = tick, Message = function() return handle end }
+end
+
+-- ── buffered logger ────────────────────────────────────────────────────
+function Client:FlushLogs()
+	if #self._logs == 0 then return end
+	local t = concat(self._logs, "\n")
+	self._logs = {}
+	return self:Send(Format.Code(t))
+end
+function Client:Log(...)
+	local p = {}
+	for i = 1, select("#", ...) do p[i] = tostring((select(i, ...))) end
+	local buf = self._logs
+	buf[#buf + 1] = trunc(os.date("%H:%M:%S") .. "  " .. concat(p, " "), 400)
+	local size = 0
+	for _, l in ipairs(buf) do size = size + #l + 1 end
+	if size > 1700 then
+		self:FlushLogs()
+	elseif not self._logT then
+		self._logT = true
+		task.delay(self.LogInterval, function() self._logT = false; self:FlushLogs() end)
+	end
+end
+
+-- ── watchers ───────────────────────────────────────────────────────────
+function Client:WatchDisconnect(o)
+	o = o or {}
+	local conns, last = {}, -100
+	local function fire(reason)
+		if clock() - last < 15 then return end
+		last = clock()
+		self:Error("Disconnected", reason or "Connection lost", { Ping = o.Ping ~= false, Context = true })
+		if o.OnDisconnect then pcall(o.OnDisconnect, reason) end
+	end
+	local gui = service("GuiService")
+	if gui then
+		conns[#conns + 1] = gui.ErrorMessageChanged:Connect(function(msg) if msg and msg ~= "" then fire(msg) end end)
+	end
+	pcall(function()
+		local overlay = service("CoreGui").RobloxPromptGui.promptOverlay
+		conns[#conns + 1] = overlay.ChildAdded:Connect(function(ch)
+			if ch.Name == "ErrorPrompt" then
+				local msg = "Roblox error prompt"
+				pcall(function() msg = ch.MessageArea.ErrorFrame.ErrorMessage.Text end)
+				fire(msg)
+			end
+		end)
+	end)
+	return { Stop = function() for _, c in ipairs(conns) do pcall(function() c:Disconnect() end) end end }
+end
+
+-- WatchPlayers{ Only = {"name"|userId,...}, Join = true, Leave = true, Existing = false, Ping = false, Level = "info" }
+function Client:WatchPlayers(o)
+	o = o or {}
+	local only
+	if o.Only then
+		only = {}
+		for _, n in ipairs(o.Only) do only[tostring(n):lower()] = true end
+	end
+	local lp = Players.LocalPlayer
+	local function want(p)
+		if p == lp then return false end
+		if only then return only[p.Name:lower()] or only[p.DisplayName:lower()] or only[tostring(p.UserId)] or false end
+		return true
+	end
+	local function announce(p, verb)
+		self:Notify(o.Level or "info", "Player " .. verb,
+			fmt("[%s](https://www.roblox.com/users/%d/profile) (`@%s`)", p.DisplayName, p.UserId, p.Name),
+			{ Thumbnail = fmt(HEADSHOT, p.UserId), Ping = o.Ping })
+	end
+	local conns = {}
+	if o.Join ~= false then
+		conns[#conns + 1] = Players.PlayerAdded:Connect(function(p) if want(p) then announce(p, "joined") end end)
+	end
+	if o.Leave ~= false then
+		conns[#conns + 1] = Players.PlayerRemoving:Connect(function(p) if want(p) then announce(p, "left") end end)
+	end
+	if o.Existing then for _, p in ipairs(Players:GetPlayers()) do if want(p) then announce(p, "is here") end end end
+	return { Stop = function() for _, c in ipairs(conns) do c:Disconnect() end end }
+end
+
+--══════════════════════════════════════════════════════════════════════════
+--  STATS  (session tracking · rates · history · charts · reports)
+--══════════════════════════════════════════════════════════════════════════
+local Stats = {}
+Stats.__index = Stats
+
+function Client:Stats(o)
+	o = o or {}
+	return setmetatable({
+		_c = self, Title = o.Title or "Session Stats", Color = o.Color, Compact = o.Compact, Theme = o.Theme,
+		Items = {}, Order = {}, SampleEvery = o.SampleEvery or 15, MaxSamples = o.MaxSamples or 240,
+		StartTime = time(), _ms = {}, _stall = {},
+	}, Stats)
+end
+
+local function itemFmt(it, v)
+	local f = it.Fmt
+	if type(f) == "function" then return f(v) end
+	if f == "time" then return Format.Duration(v) end
+	if f == "percent" then return Format.Percent(v) end
+	if f == "commas" then return Format.Commas(v) end
+	return num(v, it.Decimals or 2) .. (it.Unit and (" " .. it.Unit) or "")
+end
+
+local function restore(it, p)
+	if type(p) ~= "table" then return end
+	it.start, it.t0 = p.s, p.t0
+	if not it.get and p.v then it.value = p.v end
+	if type(p.h) == "table" then
+		for i = 1, #p.h - 1, 2 do it.hist[#it.hist + 1] = { p.h[i], p.h[i + 1] } end
+	end
+end
+
+function Stats:_item(name)
+	local it = self.Items[name]
+	if not it then
+		it = { Name = name, hist = {}, lastChange = clock(), t0 = time() }
+		self.Items[name] = it
+		self.Order[#self.Order + 1] = name
+		if self._pst and self._pst[name] then restore(it, self._pst[name]) end
+		self:Start()
+	end
+	return it
+end
+
+function Stats:_apply(it, v)
+	if it.value ~= v then it.lastChange = clock() end
+	if it.start == nil then it.start = v end
+	it.value = v
+	local ms = self._ms[it.Name]
+	if ms then
+		local k = floor(v / ms.step)
+		if ms.last == nil then ms.last = k
+		elseif k > ms.last then
+			ms.last = k
+			self._c:Success("Milestone: " .. it.Name,
+				fmt("**%s** reached `%s`", it.Name, itemFmt(it, k * ms.step)),
+				{ Ping = ms.Ping, Chart = ms.Chart, Context = ms.Context })
+		end
+	end
+end
+
+function Stats:_read(it)
+	if it.get then
+		local ok, v = pcall(it.get)
+		if ok and type(v) == "number" then self:_apply(it, v) end
+	end
+end
+
+-- Track("Coins", Value | function | number, { Icon, Unit, Format = fn|"time"|"percent"|"commas", Decimals, Hidden })
+function Stats:Track(name, src, o)
+	o = o or {}
+	local it = self:_item(name)
+	if typeof(src) == "Instance" then
+		local inst = src
+		it.get = function() return inst.Value end
+	elseif type(src) == "function" then
+		it.get = src
+	elseif type(src) == "number" then
+		self:_apply(it, src)
+	end
+	it.Icon, it.Unit, it.Fmt, it.Hidden, it.Decimals = o.Icon, o.Unit, o.Format, o.Hidden, o.Decimals
+	self:_read(it)
+	return self
+end
+
+function Stats:Set(name, v) self:_apply(self:_item(name), v); return self end
+function Stats:Add(name, n)
+	local it = self:_item(name)
+	self:_apply(it, (it.value or 0) + (n or 1))
+	return self
+end
+function Stats:Get(name) local it = self.Items[name]; return it and it.value or 0 end
+function Stats:Gain(name)
+	local it = self.Items[name]
+	return (it and it.value and it.start) and (it.value - it.start) or 0
+end
+function Stats:Elapsed() return time() - self.StartTime end
+-- per: "sec" | "min" | "hour" (default) | "day"
+function Stats:Rate(name, per)
+	local it = self.Items[name]
+	if not it then return 0 end
+	local el = max(time() - (it.t0 or self.StartTime), 1)
+	return self:Gain(name) / el * (({ sec = 1, min = 60, hour = 3600, day = 86400 })[per or "hour"] or 3600)
+end
+
+function Stats:Milestone(name, step, o)
+	o = o or {}
+	self._ms[name] = { step = step, Ping = o.Ping, Chart = o.Chart, Context = o.Context }
+	self:_item(name)
+	return self
+end
+function Stats:Stall(name, seconds, o)
+	o = o or {}
+	self._stall[name] = { after = seconds, Ping = o.Ping, Recover = o.Recover ~= false }
+	self:_item(name)
+	return self
+end
+
+function Stats:Sample()
+	local t = time()
+	for _, name in ipairs(self.Order) do
+		local it = self.Items[name]
+		self:_read(it)
+		if it.value ~= nil then
+			local h = it.hist
+			h[#h + 1] = { t, it.value }
+			if #h > self.MaxSamples then
+				local nh = {}
+				for i = 1, #h, 2 do nh[#nh + 1] = h[i] end
+				if nh[#nh] ~= h[#h] then nh[#nh + 1] = h[#h] end
+				it.hist = nh
+			end
+		end
+		local st = self._stall[name]
+		if st then
+			local idle = clock() - it.lastChange
+			if idle >= st.after and not st.fired then
+				st.fired = true
+				self._c:Warn(name .. " stalled", fmt("No change in **%s** for `%s`.", name, Format.Duration(idle, true)), { Ping = st.Ping, Context = true })
+			elseif idle < st.after and st.fired then
+				st.fired = false
+				if st.Recover then self._c:Success(name .. " recovered", "Changing again.") end
+			end
+		end
+	end
+	self:_save()
+end
+
+function Stats:Start()
+	if self._loop then return self end
+	local alive = true
+	self._loop = { Stop = function() alive = false; self._loop = nil end }
+	task.spawn(function()
+		while alive do
+			task.wait(self.SampleEvery)
+			if alive then
+				local ok, err = pcall(self.Sample, self)
+				if not ok then warn("[Hook] Stats sample: " .. tostring(err)) end
+			end
+		end
+	end)
+	return self
+end
+function Stats:Stop()
+	if self._loop then self._loop.Stop() end
+	if self._auto then self._auto.Stop() end
+	if self._live then self._live.Stop() end
+end
+
+function Stats:Reset()
+	self.StartTime = time()
+	for _, it in pairs(self.Items) do it.start, it.t0, it.hist, it.reported = it.value, time(), {}, nil end
+	self:_save()
+end
+
+function Stats:Persist(file, o)
+	o = o or {}
+	self._file = file
+	if not (isfile and readfile and writefile) then return self end
+	local ok, d = pcall(function() if isfile(file) then return jdec(readfile(file)) end end)
+	if ok and type(d) == "table" and d.t0 and (time() - d.t0) < (o.Expire or 43200) then
+		self.StartTime = d.t0
+		self._pst = d.items or {}
+		for name, p in pairs(self._pst) do
+			local it = self.Items[name]
+			if it then it.hist = {}; restore(it, p) end
+		end
+	end
+	return self
+end
+
+function Stats:_save()
+	if not self._file or not writefile then return end
+	pcall(function()
+		local items = {}
+		for name, it in pairs(self.Items) do
+			local h = {}
+			for _, p in ipairs(it.hist) do h[#h + 1] = p[1]; h[#h + 1] = p[2] end
+			items[name] = { s = it.start, v = it.value, t0 = it.t0, h = h }
+		end
+		writefile(self._file, jenc({ t0 = self.StartTime, items = items }))
+	end)
+end
+
+-- history series for charts. mode: "value" | "gain" | "rate" (per `per`, default hour)
+function Stats:_hist(it, mode, per)
+	local out = {}
+	local pm = ({ sec = 1, min = 60, hour = 3600, day = 86400 })[per or "hour"] or 3600
+	local h = it.hist
+	if mode == "rate" then
+		for i = 2, #h do
+			local dt = max(h[i][1] - h[i - 1][1], 1)
+			out[#out + 1] = { h[i][1], (h[i][2] - h[i - 1][2]) / dt * pm }
+		end
+	elseif mode == "gain" then
+		for _, p in ipairs(h) do out[#out + 1] = { p[1], p[2] - (it.start or 0) } end
+	else
+		for _, p in ipairs(h) do out[#out + 1] = { p[1], p[2] } end
+	end
+	return out
+end
+
+function Stats:_val(it, mode, per)
+	if mode == "rate" then return self:Rate(it.Name, per) end
+	if mode == "gain" then return self:Gain(it.Name) end
+	return it.value or 0
+end
+
+-- Chart("Coins" | {"Coins","Gems"}, { Type = "area"|"line"|"spark"|"bar"|"hbar"|"pie"|"donut"|"gauge", Mode = "value"|"gain"|"rate", Per = "hour", Title, Theme, Width, Height, ... })
+function Stats:Chart(names, o)
+	o = o or {}
+	if type(names) == "string" then names = { names } end
+	names = names or self.Order
+	local kind = tostring(o.Type or "area"):lower()
+	local mode, per = o.Mode or "value", o.Per or "hour"
+	local co = {}
+	for k, v in pairs(o) do co[k] = v end
+	co.Theme = co.Theme or self.Theme
+	if kind == "line" or kind == "area" or kind == "spark" then
+		local series = {}
+		for _, n in ipairs(names) do
+			local it = self.Items[n]
+			if it then series[#series + 1] = { Name = n, Data = self:_hist(it, mode, per) } end
+		end
+		co.Series, co.XTime = series, true
+		if #names == 1 then co.Title = co.Title or names[1] end
+		co.YFormat = co.YFormat or (self.Items[names[1]] and self.Items[names[1]].Fmt == "percent" and function(v) return fmt("%d%%", v) end) or nil
+		co.Subtitle = co.Subtitle or (mode == "rate" and ("PER " .. per) or (mode == "gain" and "SESSION GAIN" or nil))
+	elseif kind == "gauge" then
+		local it = self.Items[names[1]]
+		co.Value = it and self:_val(it, mode, per) or 0
+		co.Label = co.Label or names[1]
+	else
+		local items = {}
+		for _, n in ipairs(names) do
+			local it = self.Items[n]
+			if it then items[#items + 1] = { n, self:_val(it, mode, per) } end
+		end
+		co.Items = items
+		co.Subtitle = co.Subtitle or (mode == "rate" and ("PER " .. per) or (mode == "gain" and "SESSION GAIN" or nil))
+	end
+	return self._c:Chart(kind, co)
+end
+
+function Stats:Embed(o)
+	o = o or {}
+	local e = self._c:Embed():Title(o.Title or self.Title)
+	if o.Color or self.Color then e:Color(o.Color or self.Color) end
+	e:Description(fmt("⏱ Session **%s**  ·  Updated %s", Format.Duration(self:Elapsed()), Mention.Time(time(), "R")))
+	local compact = o.Compact
+	if compact == nil then compact = self.Compact end
+	for _, name in ipairs(self.Order) do
+		local it = self.Items[name]
+		if not it.Hidden and it.value ~= nil then
+			local function d(v) return (v >= 0 and "+" or "-") .. itemFmt(it, abs(v)) end
+			local gain = it.value - (it.start or it.value)
+			local val
+			if compact then
+				val = "**" .. itemFmt(it, it.value) .. "**" .. (gain ~= 0 and (" (" .. d(gain) .. ")") or "")
+			else
+				local lines = { "**" .. itemFmt(it, it.value) .. "**" }
+				if it.reported then
+					lines[#lines + 1] = Format.Trend(it.value - it.reported, function(v) return itemFmt(it, v) end)
+				end
+				lines[#lines + 1] = fmt("`%s/hr` · session `%s`", d(self:Rate(name)), d(gain))
+				val = concat(lines, "\n")
+			end
+			e:Field((it.Icon and (it.Icon .. " ") or "") .. name, val, true)
+			it.reported = it.value
+		end
+	end
+	return e
+end
+
+function Stats:_charts(o)
+	local spec = o.Chart or o.Charts
+	if not spec then return {} end
+	if spec == true then spec = { self.Order[1] } end
+	if type(spec) == "string" or getmetatable(spec) == Chart then spec = { spec } end
+	local out = {}
+	for _, s in ipairs(spec) do
+		local ch
+		if type(s) == "string" then
+			ch = self:Chart(s, { Type = o.ChartType, Mode = o.ChartMode, Per = o.Per, Theme = o.Theme, Width = o.ChartWidth, Height = o.ChartHeight })
+		elseif getmetatable(s) == Chart then
+			ch = s
+		elseif type(s) == "table" then
+			ch = self:Chart(s.Stats or s[1], s)
+		end
+		if ch then out[#out + 1] = ch end
+	end
+	return out
+end
+
+-- builds the report: returns a list of embeds (extra charts become a gallery)
+function Stats:Build(o)
+	o = o or {}
+	local e = self:Embed(o)
+	local embeds = { e }
+	local charts = self:_charts(o)
+	if #charts == 1 then
+		e:Chart(charts[1])
+	elseif #charts > 1 then
+		local url = "https://www.roblox.com/#hook" .. tostring(floor(clock() * 1000))
+		e:Url(url):Chart(charts[1])
+		for i = 2, min(#charts, 4) do embeds[#embeds + 1] = newEmbed(nil):Url(url):Chart(charts[i]) end
+	end
+	return embeds
+end
+
+function Stats:Report(o)
+	o = o or {}
+	return self._c:Send(self:Build(o), o)
+end
+function Stats:Auto(seconds, o)
+	if self._auto then self._auto.Stop() end
+	self._auto = self._c:Every(seconds, function() self:Report(o) end)
+	return self._auto
+end
+function Stats:Live(seconds, o)
+	if self._live then self._live.Stop() end
+	self._live = self._c:Live(seconds, function() return self:Build(o), o end)
+	return self._live
+end
+
+--══════════════════════════════════════════════════════════════════════════
+--  EXPORT
+--══════════════════════════════════════════════════════════════════════════
+Client.new = newClient
+
+local Default = newClient()
+Default.new = newClient
+return Default
