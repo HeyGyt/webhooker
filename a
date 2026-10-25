@@ -32,6 +32,12 @@
     local c = Hook:Chart("area", { Title = "Coins/hr", Data = {1,4,2,8}, Theme = "Amber" })
     Hook:Send(c)   Hook:Chart("pie", { Items = { Cats = 40, Dogs = 25 } }):Send()
     Hook:Chart("gauge", { Value = 76, Label = "BACKPACK" }) 
+    GRID (many charts → ONE png, or send them separately):
+    local a, b = Hook:Chart("line", {Title="Coins", Data=d1}), Hook:Chart("donut", {Title="Eggs", Items=e})
+    Hook:Grid({ a, b, { Chart = c, Span = 2 } }, { Columns = 2, Title = "Dashboard" }):Send()
+    Hook:SendCharts({ a, b, c }, { Grid = true })      -- one image      (Grid = false → separate)
+    stats:Grid(nil, { Type = "area", Mode = "rate", Columns = 3 }):Send()   -- subplot per stat
+    stats:Report{ Chart = {"Coins","Gems","Eggs"}, Grid = { Columns = 3 } }
     Themes: Mono · Light · Amber · Matrix · Ice · Rose · or { Background, Foreground, Accent, Grid, Fill }
 
     ── WATCHERS ─────────────────────────────────────────────────────────────
@@ -897,6 +903,7 @@ local chartN = 0
 local PAINT = {
 	line = paintLine, area = paintLine, spark = paintLine,
 	bar = paintBar, hbar = paintHBar, pie = paintPie, donut = paintPie, gauge = paintGauge,
+	grid = true, -- handled by Chart:_paint (composite of other charts)
 }
 
 local function newChart(kind, o, baseTheme, client)
@@ -908,14 +915,86 @@ local function newChart(kind, o, baseTheme, client)
 	self.Theme = resolveTheme(o.Theme, baseTheme)
 	self.Width = clamp(floor(o.Width or (kind == "spark" and 360 or 640)), 120, 1200)
 	self.Height = clamp(floor(o.Height or (kind == "spark" and 90 or (kind == "gauge" and 260 or 320))), 60, 800)
+	if kind == "grid" then self:_layoutGrid(client, baseTheme) end
 	return self
+end
+
+-- ── grid: several charts composited into ONE image ─────────────────────
+-- Charts = { chartObj, { Chart = chartObj, Span = 2 }, { Type = "line", Data = {...} } (inline spec), ... }
+-- Opts: Columns, Width, CellHeight, Gap, Title, Subtitle, Border, Theme
+-- Sub-charts are redrawn at cell size using the GRID's theme (one palette per PNG);
+-- the original chart objects are untouched and can still be sent on their own.
+function Chart:_layoutGrid(client, baseTheme)
+	local o = self.Opts
+	local list, kids = o.Charts or {}, {}
+	for _, e in ipairs(list) do
+		local c, span = e, 1
+		if getmetatable(e) ~= Chart and type(e) == "table" then
+			span = e.Span or 1
+			c = e.Chart or e[1]
+			if not c and (e.Type or e.Kind) then c = newChart(e.Type or e.Kind, e, baseTheme, client) end
+		end
+		if getmetatable(c) ~= Chart then error("Hook: Grid entries must be charts or chart specs", 4) end
+		kids[#kids + 1] = { chart = c, span = max(1, floor(span)) }
+	end
+	if #kids == 0 then error("Hook: Grid needs at least one chart", 4) end
+	local cols = clamp(floor(o.Columns or min(4, ceil(sqrt(#kids)))), 1, 8)
+	local gap = o.Gap or 10
+	local W = clamp(floor(o.Width or (cols * 380)), 320, 1600)
+	local cw = floor((W - gap * (cols + 1)) / cols)
+	local ch = floor(o.CellHeight or 240)
+	local hh = o.Title and 42 or gap
+	local col, row = 0, 0
+	for _, k in ipairs(kids) do
+		k.span = min(k.span, cols)
+		if col + k.span > cols then row = row + 1; col = 0 end
+		k.col, k.row = col, row
+		col = col + k.span
+		if col >= cols then row = row + 1; col = 0 end
+	end
+	local rows = row + (col > 0 and 1 or 0)
+	self._grid = { place = kids, cw = cw, ch = ch, gap = gap, hh = hh, cols = cols, rows = rows }
+	self.Width = W
+	self.Height = clamp(hh + rows * (ch + gap), 60, 3000)
+end
+
+function Chart:Children()
+	local out = {}
+	if self._grid then for _, k in ipairs(self._grid.place) do out[#out + 1] = k.chart end end
+	return out
+end
+
+local function paintGrid(self, cv, T)
+	local g, o = self._grid, self.Opts
+	if o.Title then cv:text(o.Title, 14, 12, 2, 1, 0, "left", true) end
+	if o.Subtitle then cv:text(o.Subtitle, cv.w - 14, 19, 1, 0.55, 0, "right") end
+	local W = cv.w
+	for _, p in ipairs(g.place) do
+		local w = p.span * g.cw + (p.span - 1) * g.gap
+		local x0 = g.gap + p.col * (g.cw + g.gap)
+		local y0 = g.hh + p.row * (g.ch + g.gap)
+		local sub = p.chart:_paint(w, g.ch, T).buf
+		local dst = cv.buf
+		for y = 0, g.ch - 1 do
+			local so, d = y * w, (y0 + y) * W + x0
+			for x = 1, w do
+				local v = sub[so + x]
+				if v ~= 0 then dst[d + x] = v end
+			end
+		end
+		if o.Border ~= false then
+			cv:hline(x0, x0 + w - 1, y0, 0.14, 0)
+			cv:hline(x0, x0 + w - 1, y0 + g.ch - 1, 0.14, 0)
+			cv:vline(x0, y0, y0 + g.ch - 1, 0.14, 0)
+			cv:vline(x0 + w - 1, y0, y0 + g.ch - 1, 0.14, 0)
+		end
+	end
 end
 
 function Chart:FileName() return "chart_" .. self._n .. ".png" end
 
--- returns PNG bytes (cached). pass true to yield between heavy steps (the sender does)
-function Chart:Render(yielding)
-	if self._png then return self._png end
+-- paint this chart onto a fresh canvas of any size using theme T (used by grids)
+function Chart:_paint(w, h, T)
 	local o = {}
 	for k, v in pairs(self.Opts) do o[k] = v end
 	if self.Kind == "spark" then
@@ -924,9 +1003,15 @@ function Chart:Render(yielding)
 	elseif self.Kind == "area" and o.Fill == nil then
 		o.Fill = true
 	end
-	local cv = newCanvas(self.Width, self.Height)
-	PAINT[self.Kind](cv, o, self.Theme, self.Kind)
-	self._png = cv:png(self.Theme, yielding)
+	local cv = newCanvas(w, h)
+	if self.Kind == "grid" then paintGrid(self, cv, T) else PAINT[self.Kind](cv, o, T, self.Kind) end
+	return cv
+end
+
+-- returns PNG bytes (cached). pass true to yield between heavy steps (the sender does)
+function Chart:Render(yielding)
+	if self._png then return self._png end
+	self._png = self:_paint(self.Width, self.Height, self.Theme):png(self.Theme, yielding)
 	return self._png
 end
 Chart.Png = Chart.Render
@@ -1197,6 +1282,27 @@ end
 
 function Client:Embed(init) return newEmbed(self, init) end
 function Client:Chart(kind, opts) return newChart(kind, opts, self.Theme, self) end
+
+-- Grid({ chartA, chartB, ... }, { Columns = 2, Title = "Dashboard", CellHeight = 220, Width = 900, Gap = 10 })
+function Client:Grid(charts, opts)
+	local o = {}
+	for k, v in pairs(opts or {}) do o[k] = v end
+	o.Charts = charts
+	return newChart("grid", o, self.Theme, self)
+end
+
+-- SendCharts(list, { Grid = true | {Columns=..}, Ping, Silent, Title, Color })
+-- Grid -> ONE composite image.  No Grid -> every chart sent separately (as embeds, 10 per message).
+function Client:SendCharts(list, o)
+	o = o or {}
+	if o.Grid then
+		local g = self:Grid(list, type(o.Grid) == "table" and o.Grid or { Title = o.Title })
+		return self:Send(self:Embed():Title(o.Title):Color(o.Color):Chart(g), o)
+	end
+	local embeds = {}
+	for _, c in ipairs(list) do embeds[#embeds + 1] = self:Embed():Chart(c) end
+	return self:Send(embeds, o)
+end
 
 -- ── message composition ────────────────────────────────────────────────
 local function pingText(self, ping)
@@ -1921,6 +2027,23 @@ function Stats:Chart(names, o)
 	return self._c:Chart(kind, co)
 end
 
+-- Grid({"Coins","Gems","Eggs"} | nil=all, { Type = "area", Mode = "rate", Columns = 2, Title = "...", Per = "hour" })
+-- one subplot per stat, composited into a single PNG
+function Stats:Grid(names, o)
+	o = o or {}
+	names = names or self.Order
+	local charts = {}
+	for _, n in ipairs(names) do
+		if self.Items[n] then
+			charts[#charts + 1] = self:Chart(n, { Type = o.Type, Mode = o.Mode, Per = o.Per, Theme = o.Theme, Title = n })
+		end
+	end
+	local go = {}
+	for k, v in pairs(o) do go[k] = v end
+	go.Theme = go.Theme or self.Theme
+	return self._c:Grid(charts, go)
+end
+
 function Stats:Embed(o)
 	o = o or {}
 	local e = self._c:Embed():Title(o.Title or self.Title)
@@ -1967,6 +2090,10 @@ function Stats:_charts(o)
 			ch = self:Chart(s.Stats or s[1], s)
 		end
 		if ch then out[#out + 1] = ch end
+	end
+	-- Grid = true | { Columns = 2, ... }  ->  pack every chart into one image
+	if o.Grid and #out > 1 then
+		return { self._c:Grid(out, type(o.Grid) == "table" and o.Grid or {}) }
 	end
 	return out
 end
